@@ -2,6 +2,7 @@
 
 import logging
 import re
+from typing import Optional, Tuple
 
 import gspread
 from google.oauth2.service_account import Credentials
@@ -75,9 +76,12 @@ class SheetsClient:
                 return ws
         raise ValueError(f"Worksheet with GID {gid} not found")
 
-    def find_debtor_row(self, debtor_fio: str) -> tuple[int, dict] | None:
+    def find_debtor_row(
+        self, debtor_fio: str, partner_hint: Optional[str] = None
+    ) -> Optional[Tuple[int, dict]]:
         """
         Search for debtor by FIO (fuzzy match).
+        If partner_hint is given, uses it to disambiguate duplicates.
         Returns (row_number_1based, row_data_dict) or None.
         """
         all_values = self.worksheet.get_all_values()
@@ -85,8 +89,7 @@ class SheetsClient:
             return None
 
         normalized_query = _normalize_fio(debtor_fio)
-        best_match = None
-        best_score = 0
+        candidates = []
 
         # Skip header row (index 0)
         for idx, row in enumerate(all_values[1:], start=2):
@@ -100,24 +103,46 @@ class SheetsClient:
             score_ratio = fuzz.ratio(normalized_query, normalized_cell)
             score_partial = fuzz.partial_ratio(normalized_query, normalized_cell)
             score_sort = fuzz.token_sort_ratio(normalized_query, normalized_cell)
-            score = max(score_ratio, score_partial, score_sort)
+            fio_score = max(score_ratio, score_partial, score_sort)
 
-            if score > best_score:
-                best_score = score
-                best_match = (idx, row, cell_fio)
+            if fio_score >= FUZZY_MATCH_THRESHOLD:
+                cell_partner = row[COL_PARTNER].strip() if len(row) > COL_PARTNER else ""
+                candidates.append((idx, row, cell_fio, cell_partner, fio_score))
 
-        if best_match and best_score >= FUZZY_MATCH_THRESHOLD:
-            row_num, row_data, matched_fio = best_match
-            logger.info(
-                "Fuzzy match: '%s' → '%s' (score=%d, row=%d)",
-                debtor_fio,
-                matched_fio,
-                best_score,
-                row_num,
-            )
-            return row_num, {
-                "fio": matched_fio,
-                "partner": row_data[COL_PARTNER] if len(row_data) > COL_PARTNER else "",
+        if not candidates:
+            logger.warning("No match for '%s' in sheet", debtor_fio)
+            return None
+
+        # If partner hint given — pick the candidate whose partner matches best
+        if partner_hint and len(candidates) > 1:
+            norm_hint = _normalize_fio(partner_hint)
+            best = None
+            best_combined = 0
+            for idx, row, cell_fio, cell_partner, fio_score in candidates:
+                partner_score = fuzz.partial_ratio(norm_hint, _normalize_fio(cell_partner))
+                combined = fio_score + partner_score
+                if combined > best_combined:
+                    best_combined = combined
+                    best = (idx, row, cell_fio, cell_partner, fio_score)
+            if best:
+                idx, row, cell_fio, cell_partner, fio_score = best
+                logger.info(
+                    "Matched by FIO+partner: '%s'+'%s' → '%s'+'%s' (fio=%d, row=%d)",
+                    debtor_fio, partner_hint, cell_fio, cell_partner, fio_score, idx,
+                )
+                candidates = [best]
+
+        # Take best by FIO score
+        best_candidate = max(candidates, key=lambda c: c[4])
+        row_num, row_data, matched_fio, matched_partner, score = best_candidate
+
+        logger.info(
+            "Fuzzy match: '%s' → '%s' (score=%d, partner='%s', row=%d)",
+            debtor_fio, matched_fio, score, matched_partner, row_num,
+        )
+        return row_num, {
+            "fio": matched_fio,
+            "partner": row_data[COL_PARTNER] if len(row_data) > COL_PARTNER else "",
                 "plan": row_data[COL_PLAN] if len(row_data) > COL_PLAN else "",
                 "fact": row_data[COL_FACT] if len(row_data) > COL_FACT else "",
                 "debt": row_data[COL_DEBT] if len(row_data) > COL_DEBT else "",

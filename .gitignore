@@ -3,3 +3,5 @@ service_account.json
 __pycache__/
 *.pyc
 .venv/
+.DS_Store
+bot.log

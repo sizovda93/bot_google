@@ -6,7 +6,8 @@ from dataclasses import dataclass
 class Config:
     telegram_bot_token: str
     telegram_chat_id: int
-    anthropic_api_key: str
+    openai_api_key: str
+    openai_base_url: str
     google_sheets_id: str
     google_sheet_gid: int
     google_service_account_path: str
@@ -18,7 +19,8 @@ class Config:
         return cls(
             telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=int(os.environ["TELEGRAM_CHAT_ID"]),
-            anthropic_api_key=os.environ["ANTHROPIC_API_KEY"],
+            openai_api_key=os.environ["OPENAI_API_KEY"],
+            openai_base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
             google_sheets_id=os.environ.get(
                 "GOOGLE_SHEETS_ID",
                 "14bZiqurDD9_tMJ6OiScWf4-TL2JQ2Wo6MeXyc_ti8KA",

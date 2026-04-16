@@ -1,5 +1,5 @@
 aiogram>=3.10,<4
-anthropic>=0.40,<1
+openai>=1.30,<2
 gspread>=6.0,<7
 google-auth>=2.0,<3
 thefuzz[speedup]>=0.22
