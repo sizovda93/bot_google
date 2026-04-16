@@ -93,6 +93,7 @@ async def handle_reply_with_partner(message: Message, bot: Bot) -> None:
         total_amount=data["total_amount"],
         date=data["date"],
         caption_partner=partner,
+        is_deposit=data.get("is_deposit", False),
         tmp_path=Path(data["tmp_path"]),
         ext=data["ext"],
         processing_msg_id=data["processing_msg_id"],
@@ -120,7 +121,7 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
         logger.info("Downloaded: %s (%d bytes)", tmp_path.name, tmp_path.stat().st_size)
 
         # Step 2: Extract client FIOs + partner from caption (via LLM)
-        caption_data = CaptionData(clients=[], partner=None)
+        caption_data = CaptionData(clients=[], partner=None, is_deposit=False)
         if message.caption:
             caption_data = await parse_caption(
                 message.caption, config.openai_api_key, config.openai_base_url
@@ -168,6 +169,7 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
             total_amount=receipt.amount,
             date=receipt.date,
             caption_partner=caption_partner,
+            is_deposit=caption_data.is_deposit,
             tmp_path=tmp_path,
             ext=ext,
             processing_msg_id=processing_msg.message_id,
@@ -190,6 +192,7 @@ async def _finish_multi(
     total_amount: float,
     date: Optional[str],
     caption_partner: Optional[str],
+    is_deposit: bool,
     tmp_path: Path,
     ext: str,
     processing_msg_id: int,
@@ -226,6 +229,7 @@ async def _finish_multi(
                 "amount_per_client": amount_per_client,
                 "total_amount": total_amount,
                 "date": date,
+                "is_deposit": is_deposit,
                 "tmp_path": str(tmp_path),
                 "ext": ext,
                 "processing_msg_id": ask_msg.message_id,
@@ -251,10 +255,17 @@ async def _finish_multi(
             match = sheets.find_debtor_row(client_fio, partner_hint=caption_partner)
             if match:
                 row_num, row_data = match
+                # Build comment for deposit payments
+                deposit_comment = None
+                if is_deposit:
+                    amt_fmt = "{:,.0f}".format(amount_per_client).replace(",", " ")
+                    deposit_comment = "{} с депозита".format(amt_fmt)
+
                 sheets.update_payment(
                     row_num=row_num,
                     amount=amount_per_client,
                     check_link=public_url,
+                    comment=deposit_comment,
                 )
                 results.append("✅ {} — строка {} ({})".format(
                     row_data["fio"], row_num, row_data["partner"]

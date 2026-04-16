@@ -17,6 +17,7 @@ COL_PLAN = 5         # F — Обязательные план
 COL_FACT = 6         # G — Обязательные факт
 COL_DEBT = 7         # H — Долг
 COL_CHECK_LINK = 8   # I — Чек об оплате (ссылка)
+COL_COMMENT = 11     # L — Комментарий по оплате долга
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -154,8 +155,10 @@ class SheetsClient:
         )
         return None
 
-    def update_payment(self, row_num: int, amount: float, check_link: str) -> None:
-        """Update the fact amount, debt, and check link for a row."""
+    def update_payment(
+        self, row_num: int, amount: float, check_link: str, comment: Optional[str] = None
+    ) -> None:
+        """Update the fact amount, debt, check link, and optionally comment."""
         # Read current plan value to calculate new debt
         plan_cell = self.worksheet.cell(row_num, COL_PLAN + 1).value
         plan_amount = _parse_money(plan_cell)
@@ -174,10 +177,14 @@ class SheetsClient:
         # Append link (don't overwrite if there's already one)
         existing_link = self.worksheet.cell(row_num, COL_CHECK_LINK + 1).value
         if existing_link and existing_link.strip():
-            new_link_value = f"{existing_link}\n{check_link}"
+            new_link_value = "{}\n{}".format(existing_link, check_link)
         else:
             new_link_value = check_link
         self.worksheet.update_cell(row_num, COL_CHECK_LINK + 1, new_link_value)
+
+        # Write comment if provided
+        if comment:
+            self.worksheet.update_cell(row_num, COL_COMMENT + 1, comment)
 
         logger.info(
             "Updated row %d: fact=%s, debt=%s, link=%s",

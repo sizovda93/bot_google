@@ -98,10 +98,13 @@ CAPTION_PROMPT = """\
 - Партнёр — это НАЗВАНИЕ организации/компании/города. Обычно идёт ПОСЛЕ фамилий клиентов или на отдельной строке.
 - Слова "оплата", "депозит", "публикации", "чек об оплате" — это НЕ часть ФИО и НЕ партнёр.
 
-Верни ТОЛЬКО валидный JSON без markdown-обёртки:
-{"clients": ["Фамилия И.О.", "Фамилия2 И.О."], "partner": "Название партнёра"}
+Также определи, есть ли в подписи слово "депозит" / "на депозите" / "депозита" — это значит оплата с депозита.
 
-Если партнёра не видно — поставь null. Список клиентов — всегда массив (даже если один).
+Верни ТОЛЬКО валидный JSON без markdown-обёртки:
+{"clients": ["Фамилия И.О.", "Фамилия2 И.О."], "partner": "Название партнёра", "is_deposit": true}
+
+Если партнёра не видно — поставь null. is_deposit = true если есть слово "депозит", иначе false.
+Список клиентов — всегда массив (даже если один).
 """
 
 
@@ -109,6 +112,7 @@ CAPTION_PROMPT = """\
 class CaptionData:
     clients: list  # List[str]
     partner: Optional[str]
+    is_deposit: bool
 
 
 async def parse_caption(
@@ -136,14 +140,15 @@ async def parse_caption(
         data = json.loads(text)
         clients = data.get("clients") or []
         partner = data.get("partner")
+        is_deposit = bool(data.get("is_deposit", False))
         # Backward compat: if old format with client_fio
         if not clients and data.get("client_fio"):
             clients = [data["client_fio"]]
-        logger.info("Caption parsed: clients=%s, partner=%s", clients, partner)
-        return CaptionData(clients=clients, partner=partner)
+        logger.info("Caption parsed: clients=%s, partner=%s, deposit=%s", clients, partner, is_deposit)
+        return CaptionData(clients=clients, partner=partner, is_deposit=is_deposit)
     except json.JSONDecodeError:
         logger.warning("Failed to parse caption response: %s", text)
-        return CaptionData(clients=[], partner=None)
+        return CaptionData(clients=[], partner=None, is_deposit=False)
 
 
 async def parse_receipt(
