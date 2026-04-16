@@ -85,13 +85,14 @@ async def handle_reply_with_partner(message: Message, bot: Bot) -> None:
         return
 
     data = pending_receipts.pop(reply_to_id)
-    await _finish_processing(
+    await _finish_multi(
         message=message,
         bot=bot,
-        debtor_fio=data["debtor_fio"],
-        amount=data["amount"],
+        clients=data["clients"],
+        amount_per_client=data["amount_per_client"],
+        total_amount=data["total_amount"],
         date=data["date"],
-        partner=partner,
+        caption_partner=partner,
         tmp_path=Path(data["tmp_path"]),
         ext=data["ext"],
         processing_msg_id=data["processing_msg_id"],
@@ -118,13 +119,13 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
         await bot.download_file(file.file_path, tmp_path)
         logger.info("Downloaded: %s (%d bytes)", tmp_path.name, tmp_path.stat().st_size)
 
-        # Step 2: Extract client FIO + partner from caption (via LLM)
-        caption_data = CaptionData(client_fio=None, partner=None)
+        # Step 2: Extract client FIOs + partner from caption (via LLM)
+        caption_data = CaptionData(clients=[], partner=None)
         if message.caption:
             caption_data = await parse_caption(
                 message.caption, config.openai_api_key, config.openai_base_url
             )
-            logger.info("Caption: fio=%s, partner=%s", caption_data.client_fio, caption_data.partner)
+            logger.info("Caption: clients=%s, partner=%s", caption_data.clients, caption_data.partner)
 
         # Step 3: Parse receipt (amount, date, and backup FIO)
         receipt = await parse_receipt(
@@ -132,11 +133,13 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
         )
         logger.info("Parsed receipt: %s", receipt)
 
-        # Use caption FIO if available, fallback to receipt FIO
-        debtor_fio = caption_data.client_fio or receipt.debtor_fio
+        # Build client list: caption clients first, receipt FIO as fallback
+        clients = caption_data.clients
+        if not clients and receipt.debtor_fio:
+            clients = [receipt.debtor_fio]
         caption_partner = caption_data.partner
 
-        if not debtor_fio:
+        if not clients:
             await processing_msg.edit_text(
                 "❌ Не удалось определить ФИО клиента.\n"
                 "Не нашёл ни в подписи к сообщению, ни в самом чеке.\n"
@@ -146,55 +149,29 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
 
         if not receipt.amount:
             await processing_msg.edit_text(
-                "❌ Распознал клиента: *{}*, "
+                "❌ Распознал клиентов: *{}*, "
                 "но не смог определить сумму.\n"
-                "Проверьте чек вручную.".format(debtor_fio),
+                "Проверьте чек вручную.".format(", ".join(clients)),
                 parse_mode="Markdown",
             )
             return
 
-        # Step 4: Find debtor in Google Sheet (partner hint for disambiguation)
-        match = sheets.find_debtor_row(debtor_fio, partner_hint=caption_partner)
+        # Step 4: Multi-client processing
+        num_clients = len(clients)
+        amount_per_client = receipt.amount / num_clients
 
-        if match:
-            row_num, row_data = match
-            partner = row_data["partner"]
-            logger.info("Found in sheet: row %d, partner=%s", row_num, partner)
-
-            # Partner found in table — go straight to upload
-            await _finish_processing(
-                message=message,
-                bot=bot,
-                debtor_fio=row_data["fio"],
-                amount=receipt.amount,
-                date=receipt.date,
-                partner=partner,
-                tmp_path=tmp_path,
-                ext=ext,
-                processing_msg_id=processing_msg.message_id,
-            )
-        else:
-            # Client not in table — ask for partner name via reply
-            amount_fmt = "{:,.0f}".format(receipt.amount).replace(",", " ")
-            ask_msg = await processing_msg.edit_text(
-                "⚠️ Не нашёл *{}* в таблице.\n"
-                "Сумма: {} ₽\n\n"
-                "Ответьте на это сообщение — укажите *имя партнёра*.".format(
-                    debtor_fio, amount_fmt
-                ),
-                parse_mode="Markdown",
-            )
-
-            # Save pending receipt for when partner reply comes
-            pending_receipts[ask_msg.message_id] = {
-                "debtor_fio": debtor_fio,
-                "amount": receipt.amount,
-                "date": receipt.date,
-                "tmp_path": str(tmp_path),
-                "ext": ext,
-                "processing_msg_id": ask_msg.message_id,
-            }
-            logger.info("Pending receipt for '%s', waiting for partner reply", debtor_fio)
+        await _finish_multi(
+            message=message,
+            bot=bot,
+            clients=clients,
+            amount_per_client=amount_per_client,
+            total_amount=receipt.amount,
+            date=receipt.date,
+            caption_partner=caption_partner,
+            tmp_path=tmp_path,
+            ext=ext,
+            processing_msg_id=processing_msg.message_id,
+        )
 
     except Exception as e:
         logger.exception("Error processing receipt")
@@ -205,67 +182,120 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
         )
 
 
-async def _finish_processing(
+async def _finish_multi(
     message: Message,
     bot: Bot,
-    debtor_fio: str,
-    amount: float,
+    clients: list,
+    amount_per_client: float,
+    total_amount: float,
     date: Optional[str],
-    partner: str,
+    caption_partner: Optional[str],
     tmp_path: Path,
     ext: str,
     processing_msg_id: int,
 ) -> None:
-    """Upload to YaDisk, update sheet, confirm in chat."""
+    """Upload one receipt, update sheet for each client, confirm in chat."""
     try:
-        # Step 5: Upload to Yandex Disk
-        target_filename = _make_target_filename(debtor_fio, ext)
+        # Step 5: Find first client to determine partner for YaDisk folder
+        first_match = None
+        partner = caption_partner
+        for c in clients:
+            m = sheets.find_debtor_row(c, partner_hint=caption_partner)
+            if m:
+                first_match = m
+                partner = m[1]["partner"]
+                break
+
+        if not partner:
+            # No partner from table or caption — ask via reply
+            clients_str = ", ".join(clients)
+            amount_fmt = "{:,.0f}".format(total_amount).replace(",", " ")
+            ask_msg = await bot.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=processing_msg_id,
+                text=(
+                    "⚠️ Не смог определить партнёра.\n"
+                    "Клиенты: *{}*\n"
+                    "Сумма: {} ₽\n\n"
+                    "Ответьте на это сообщение — укажите *имя партнёра*."
+                ).format(clients_str, amount_fmt),
+                parse_mode="Markdown",
+            )
+            pending_receipts[ask_msg.message_id] = {
+                "clients": clients,
+                "amount_per_client": amount_per_client,
+                "total_amount": total_amount,
+                "date": date,
+                "tmp_path": str(tmp_path),
+                "ext": ext,
+                "processing_msg_id": ask_msg.message_id,
+            }
+            return
+
+        # Step 6: Upload to Yandex Disk ONCE (one receipt = one file)
+        filename_parts = [_make_target_filename(c, "").rstrip(".") for c in clients]
+        target_filename = ", ".join(filename_parts) + ext
+        # If filename too long, truncate
+        if len(target_filename) > 200:
+            target_filename = filename_parts[0] + " и др" + ext
+
         public_url = yadisk_client.upload_and_share(
             local_path=tmp_path,
             partner_name=partner,
             target_filename=target_filename,
         )
 
-        # Step 6: Update Google Sheet (if debtor exists in table)
-        match = sheets.find_debtor_row(debtor_fio)
-        if match:
-            row_num, row_data = match
-            sheets.update_payment(
-                row_num=row_num,
-                amount=amount,
-                check_link=public_url,
-            )
-            sheet_status = "Таблица обновлена (строка {}).".format(row_num)
-        else:
-            sheet_status = "⚠️ Клиента нет в таблице — обновите вручную."
+        # Step 7: Update Google Sheet for EACH client
+        results = []
+        for client_fio in clients:
+            match = sheets.find_debtor_row(client_fio, partner_hint=caption_partner)
+            if match:
+                row_num, row_data = match
+                sheets.update_payment(
+                    row_num=row_num,
+                    amount=amount_per_client,
+                    check_link=public_url,
+                )
+                results.append("✅ {} — строка {} ({})".format(
+                    row_data["fio"], row_num, row_data["partner"]
+                ))
+                logger.info("Updated: %s, row %d, %s RUB", row_data["fio"], row_num, amount_per_client)
+            else:
+                results.append("⚠️ {} — не найден в таблице".format(client_fio))
+                logger.warning("Not found in sheet: %s", client_fio)
 
-        # Step 7: Confirm in chat
-        amount_fmt = "{:,.0f}".format(amount).replace(",", " ")
+        # Step 8: Confirm in chat
+        amount_fmt = "{:,.0f}".format(amount_per_client).replace(",", " ")
+        total_fmt = "{:,.0f}".format(total_amount).replace(",", " ")
+
+        if len(clients) > 1:
+            amount_line = "💰 Сумма: {} ₽ ({} ₽ на {} чел.)".format(
+                total_fmt, amount_fmt, len(clients)
+            )
+        else:
+            amount_line = "💰 Сумма: {} ₽".format(amount_fmt)
+
+        client_lines = "\n".join(results)
         await bot.edit_message_text(
             chat_id=message.chat.id,
             message_id=processing_msg_id,
             text=(
                 "✅ Чек обработан!\n\n"
-                "👤 Клиент: *{}*\n"
-                "💰 Сумма: {} ₽\n"
+                "{}\n"
                 "🏢 Партнёр: {}\n"
                 "📅 Дата: {}\n"
                 "🔗 [Ссылка на чек]({})\n\n"
                 "{}"
             ).format(
-                debtor_fio, amount_fmt, partner,
-                date or "не определена", public_url, sheet_status
+                amount_line, partner,
+                date or "не определена", public_url, client_lines
             ),
             parse_mode="Markdown",
             disable_web_page_preview=True,
         )
-        logger.info(
-            "Done: %s, %s RUB, partner=%s, url=%s",
-            debtor_fio, amount, partner, public_url,
-        )
 
     except Exception as e:
-        logger.exception("Error in finish_processing")
+        logger.exception("Error in finish_multi")
         await bot.edit_message_text(
             chat_id=message.chat.id,
             message_id=processing_msg_id,
@@ -273,7 +303,6 @@ async def _finish_processing(
             parse_mode="Markdown",
         )
     finally:
-        # Cleanup temp files
         try:
             tmp_path.unlink(missing_ok=True)
             tmp_path.parent.rmdir()
