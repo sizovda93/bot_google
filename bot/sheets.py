@@ -26,6 +26,8 @@ SCOPES = [
 
 FUZZY_MATCH_THRESHOLD = 75
 
+RUSSIAN_VOWELS = set("аеёиоуыэюяaeiouy")
+
 
 def _normalize_fio(fio: str) -> str:
     """Normalize FIO for comparison: lowercase, collapse whitespace."""
@@ -35,6 +37,46 @@ def _normalize_fio(fio: str) -> str:
     fio = fio.replace(".", " ").strip()
     fio = re.sub(r"\s+", " ", fio)
     return fio
+
+
+def _consonant_skeleton(text: str) -> str:
+    """Extract consonant skeleton from text (lowercase, only consonants).
+    'Лозинина' → 'лзнн', 'Малинина' → 'млнн'
+    Used to filter out false fuzzy matches where consonants differ.
+    """
+    text = text.lower()
+    return "".join(c for c in text if c.isalpha() and c not in RUSSIAN_VOWELS)
+
+
+def _consonants_compatible(query: str, candidate: str) -> bool:
+    """Check if two FIOs have compatible consonant structure.
+    Rules:
+    - First letter of surname MUST match (case-insensitive)
+    - Consonant skeletons must be identical, or query skeleton
+      must be a prefix of candidate skeleton (for abbreviated names)
+    """
+    q_words = query.lower().split()
+    c_words = candidate.lower().split()
+
+    if not q_words or not c_words:
+        return False
+
+    # First letter of surname must match
+    if q_words[0][0] != c_words[0][0]:
+        return False
+
+    q_skel = _consonant_skeleton(q_words[0])
+    c_skel = _consonant_skeleton(c_words[0])
+
+    # Exact match or prefix (for short/abbreviated surnames)
+    if q_skel == c_skel:
+        return True
+    if c_skel.startswith(q_skel) and len(q_skel) >= 2:
+        return True
+    if q_skel.startswith(c_skel) and len(c_skel) >= 2:
+        return True
+
+    return False
 
 
 def _parse_money(value: str) -> float:
@@ -99,6 +141,10 @@ class SheetsClient:
 
             cell_fio = row[COL_FIO].strip()
             normalized_cell = _normalize_fio(cell_fio)
+
+            # Consonant filter: reject if consonant structure doesn't match
+            if not _consonants_compatible(normalized_query, normalized_cell):
+                continue
 
             # Try multiple fuzzy strategies
             score_ratio = fuzz.ratio(normalized_query, normalized_cell)
