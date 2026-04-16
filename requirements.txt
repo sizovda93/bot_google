@@ -1,0 +1,8 @@
+aiogram>=3.10,<4
+anthropic>=0.40,<1
+gspread>=6.0,<7
+google-auth>=2.0,<3
+thefuzz[speedup]>=0.22
+pdfplumber>=0.11,<1
+yadisk>=3.0,<4
+python-dotenv>=1.0,<2
