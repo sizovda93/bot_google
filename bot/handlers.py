@@ -67,9 +67,30 @@ def _check_fio_mismatch(caption_clients: list, receipt_debtors: list) -> str:
     if not unmatched_caption:
         return ""
 
-    return "⚠️ Несовпадение ФИО!\nВ подписи: {}\nВ чеке: {}\nПроверьте правильность!".format(
+    return "⚠️ Несовпадение ФИО!\nВ подписи: {}\nВ чеке: {}\nПроверьте!".format(
         ", ".join(caption_clients),
         ", ".join(receipt_debtors),
+    )
+
+
+def _check_partner_mismatch(caption_partner: str, table_partner: str) -> str:
+    """Compare partner from caption vs table.
+    Returns warning string if mismatch, empty string if OK.
+    """
+    if not caption_partner or not table_partner:
+        return ""
+
+    score = max(
+        fuzz.ratio(caption_partner.lower(), table_partner.lower()),
+        fuzz.partial_ratio(caption_partner.lower(), table_partner.lower()),
+        fuzz.token_sort_ratio(caption_partner.lower(), table_partner.lower()),
+    )
+
+    if score >= 70:
+        return ""
+
+    return "⚠️ Несовпадение партнёра!\nВ подписи: {}\nВ таблице: {}\nПроверьте!".format(
+        caption_partner, table_partner
     )
 
 
@@ -336,9 +357,21 @@ async def _finish_multi(
         client_lines = "\n".join(results)
 
         # Add mismatch warning if any
-        warning_block = ""
+        # Collect all warnings
+        warnings = []
         if mismatch_warning:
-            warning_block = "\n{}\n".format(mismatch_warning)
+            warnings.append(mismatch_warning)
+
+        # Cross-check partner: caption vs table
+        if caption_partner and partner:
+            partner_warn = _check_partner_mismatch(caption_partner, partner)
+            if partner_warn:
+                warnings.append(partner_warn)
+                logger.warning("Partner mismatch: caption='%s' vs table='%s'", caption_partner, partner)
+
+        warning_block = ""
+        if warnings:
+            warning_block = "\n" + "\n".join(warnings) + "\n"
 
         await bot.edit_message_text(
             chat_id=message.chat.id,
