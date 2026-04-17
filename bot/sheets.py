@@ -221,17 +221,12 @@ class SheetsClient:
         # Use specific worksheet if provided, otherwise first available
         ws = worksheet or list(self.worksheets.values())[0]
 
-        plan_cell = ws.cell(row_num, COL_PLAN + 1).value
-        plan_amount = _parse_money(plan_cell)
-
         fact_cell = ws.cell(row_num, COL_FACT + 1).value
         current_fact = _parse_money(fact_cell)
         new_fact = current_fact + amount
 
-        new_debt = max(0, plan_amount - new_fact)
-
         ws.update_cell(row_num, COL_FACT + 1, _format_money(new_fact))
-        ws.update_cell(row_num, COL_DEBT + 1, _format_money(new_debt))
+        # COL_DEBT (H) не трогаем — там формула, пересчитается автоматически
 
         existing_link = ws.cell(row_num, COL_CHECK_LINK + 1).value
         if existing_link and existing_link.strip():
@@ -244,9 +239,8 @@ class SheetsClient:
             ws.update_cell(row_num, COL_COMMENT + 1, comment)
 
         logger.info(
-            "Updated row %d in '%s': fact=%s, debt=%s, link=%s",
+            "Updated row %d in '%s': fact=%s, link=%s",
             row_num, ws.title,
             _format_money(new_fact),
-            _format_money(new_debt),
             check_link,
         )
