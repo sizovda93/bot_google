@@ -262,13 +262,10 @@ class SheetsClient:
         ws.update_cell(row_num, COL_FACT + 1, int(new_fact))
         # COL_DEBT (H) не трогаем — там формула =F-G, пересчитается автоматически
 
-        # Write link as plain URL (Google Sheets auto-detects as clickable)
+        # Write link only if cell is empty (one link per client, not accumulate)
         existing_link = ws.cell(row_num, COL_CHECK_LINK + 1).value
-        if existing_link and existing_link.strip():
-            new_link_value = "{}\n{}".format(existing_link, check_link)
-        else:
-            new_link_value = check_link
-        ws.update_cell(row_num, COL_CHECK_LINK + 1, new_link_value)
+        if not existing_link or not existing_link.strip():
+            ws.update_cell(row_num, COL_CHECK_LINK + 1, check_link)
 
         if comment:
             ws.update_cell(row_num, COL_COMMENT + 1, comment)
