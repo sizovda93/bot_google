@@ -16,25 +16,26 @@ EXTRACTION_PROMPT = """\
 Ты анализируешь банковский чек или квитанцию об оплате.
 
 Извлеки из документа:
-1. **ФИО должника** — это тот, ЗА КОГО платят (не плательщик!). \
+1. **ФИО должников** — это те, ЗА КОГО платят (НЕ плательщик!). \
 Ищи в полях «Назначение платежа», «Сообщение», «Назначение перевода». \
 Обычно после слов «публикации», «на публикации», «по делу о банкротстве» \
-идёт фамилия должника. Верни полное ФИО если оно есть, или сокращённое (Фамилия И.О.) если полного нет.
+идут фамилии должников. В одном чеке может быть оплата за НЕСКОЛЬКИХ должников. \
+Верни список всех найденных ФИО (полное или сокращённое Фамилия И.О.).
 2. **Сумму платежа** — основная сумма БЕЗ комиссии. Ищи поле «Сумма», «Сумма платежа», «Сумма операции». \
 НЕ бери «Итого» если рядом есть отдельная «Комиссия».
 3. **Дату операции** — в формате ДД.ММ.ГГГГ.
 
 Верни ТОЛЬКО валидный JSON без markdown-обёртки:
-{"debtor_fio": "Фамилия Имя Отчество", "amount": 21000, "date": "08.04.2026"}
+{"debtors": ["Фамилия Имя Отчество", "Фамилия2 И.О."], "amount": 21000, "date": "08.04.2026"}
 
+Если должников не видно — верни пустой список. Сумму верни как число (int или float).
 Если какое-то поле невозможно определить — поставь null.
-Сумму верни как число (int или float), без пробелов и символа рубля.
 """
 
 
 @dataclass
 class ReceiptData:
-    debtor_fio: Optional[str]
+    debtors: list  # List[str] — all debtor names found in receipt
     amount: Optional[float]
     date: Optional[str]
 
@@ -65,14 +66,19 @@ def _parse_response(response_text: str) -> ReceiptData:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         logger.error("Failed to parse response as JSON: %s", response_text)
-        return ReceiptData(debtor_fio=None, amount=None, date=None)
+        return ReceiptData(debtors=[], amount=None, date=None)
 
     amount = data.get("amount")
     if isinstance(amount, str):
         amount = float(amount.replace(" ", "").replace(",", ".").replace("₽", ""))
 
+    # Support both old format (debtor_fio) and new (debtors list)
+    debtors = data.get("debtors") or []
+    if not debtors and data.get("debtor_fio"):
+        debtors = [data["debtor_fio"]]
+
     return ReceiptData(
-        debtor_fio=data.get("debtor_fio"),
+        debtors=debtors,
         amount=amount,
         date=data.get("date"),
     )

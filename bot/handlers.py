@@ -8,6 +8,8 @@ from typing import Optional, Dict
 from aiogram import Bot, Router, F
 from aiogram.types import Message
 
+from thefuzz import fuzz
+
 from bot.config import Config
 from bot.receipt_parser import parse_receipt, parse_caption, CaptionData
 from bot.sheets import SheetsClient
@@ -37,6 +39,37 @@ def init_services(cfg: Config) -> None:
     yadisk_client = YaDiskClient(
         token=cfg.yandex_disk_token,
         base_folder=cfg.yadisk_base_folder,
+    )
+
+
+def _check_fio_mismatch(caption_clients: list, receipt_debtors: list) -> str:
+    """Compare client names from caption vs receipt.
+    Returns warning string if mismatch, empty string if OK.
+    """
+    # For each caption client, check if any receipt debtor matches
+    unmatched_caption = []
+    for cap_name in caption_clients:
+        cap_lower = cap_name.lower().replace(".", " ").strip()
+        found = False
+        for rec_name in receipt_debtors:
+            rec_lower = rec_name.lower().replace(".", " ").strip()
+            # Check fuzzy match (surname-level)
+            score = max(
+                fuzz.partial_ratio(cap_lower, rec_lower),
+                fuzz.token_sort_ratio(cap_lower, rec_lower),
+            )
+            if score >= 70:
+                found = True
+                break
+        if not found:
+            unmatched_caption.append(cap_name)
+
+    if not unmatched_caption:
+        return ""
+
+    return "⚠️ Несовпадение ФИО!\nВ подписи: {}\nВ чеке: {}\nПроверьте правильность!".format(
+        ", ".join(caption_clients),
+        ", ".join(receipt_debtors),
     )
 
 
@@ -94,6 +127,7 @@ async def handle_reply_with_partner(message: Message, bot: Bot) -> None:
         date=data["date"],
         caption_partner=partner,
         is_deposit=data.get("is_deposit", False),
+        mismatch_warning=data.get("mismatch_warning", ""),
         tmp_path=Path(data["tmp_path"]),
         ext=data["ext"],
         processing_msg_id=data["processing_msg_id"],
@@ -134,10 +168,11 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
         )
         logger.info("Parsed receipt: %s", receipt)
 
-        # Build client list: caption clients first, receipt FIO as fallback
+        # Build client list: caption clients first, receipt debtors as fallback
         clients = caption_data.clients
-        if not clients and receipt.debtor_fio:
-            clients = [receipt.debtor_fio]
+        receipt_debtors = receipt.debtors
+        if not clients and receipt_debtors:
+            clients = receipt_debtors
         caption_partner = caption_data.partner
 
         if not clients:
@@ -157,6 +192,13 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
             )
             return
 
+        # Step 3.5: Cross-check caption clients vs receipt debtors
+        mismatch_warning = ""
+        if caption_data.clients and receipt_debtors:
+            mismatch_warning = _check_fio_mismatch(caption_data.clients, receipt_debtors)
+            if mismatch_warning:
+                logger.warning("FIO mismatch: %s", mismatch_warning)
+
         # Step 4: Multi-client processing
         num_clients = len(clients)
         amount_per_client = receipt.amount / num_clients
@@ -170,6 +212,7 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
             date=receipt.date,
             caption_partner=caption_partner,
             is_deposit=caption_data.is_deposit,
+            mismatch_warning=mismatch_warning,
             tmp_path=tmp_path,
             ext=ext,
             processing_msg_id=processing_msg.message_id,
@@ -193,6 +236,7 @@ async def _finish_multi(
     date: Optional[str],
     caption_partner: Optional[str],
     is_deposit: bool,
+    mismatch_warning: str,
     tmp_path: Path,
     ext: str,
     processing_msg_id: int,
@@ -230,6 +274,7 @@ async def _finish_multi(
                 "total_amount": total_amount,
                 "date": date,
                 "is_deposit": is_deposit,
+                "mismatch_warning": mismatch_warning,
                 "tmp_path": str(tmp_path),
                 "ext": ext,
                 "processing_msg_id": ask_msg.message_id,
@@ -289,6 +334,12 @@ async def _finish_multi(
             amount_line = "💰 Сумма: {} ₽".format(amount_fmt)
 
         client_lines = "\n".join(results)
+
+        # Add mismatch warning if any
+        warning_block = ""
+        if mismatch_warning:
+            warning_block = "\n{}\n".format(mismatch_warning)
+
         await bot.edit_message_text(
             chat_id=message.chat.id,
             message_id=processing_msg_id,
@@ -298,10 +349,11 @@ async def _finish_multi(
                 "🏢 Партнёр: {}\n"
                 "📅 Дата: {}\n"
                 "🔗 [Ссылка на чек]({})\n\n"
-                "{}"
+                "{}{}"
             ).format(
                 amount_line, partner,
-                date or "не определена", public_url, client_lines
+                date or "не определена", public_url,
+                client_lines, warning_block
             ),
             parse_mode="Markdown",
             disable_web_page_preview=True,
