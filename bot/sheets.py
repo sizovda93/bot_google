@@ -81,11 +81,23 @@ def _consonants_compatible(query: str, candidate: str) -> bool:
 
 
 def _parse_money(value: str) -> float:
-    """Parse money string like 'р.21 000' or '21000' to float."""
+    """Parse money string like 'р.21 000', 'р.21000', '21000', 21000 to float."""
     if not value:
         return 0.0
-    cleaned = re.sub(r"[^\d.,]", "", str(value))
-    cleaned = cleaned.replace(",", ".").replace(" ", "")
+    s = str(value).strip()
+    # Remove "р." / "р" prefix first (before stripping dots)
+    if s.startswith("р."):
+        s = s[2:]
+    elif s.startswith("р"):
+        s = s[1:]
+    # Remove spaces, then non-numeric except dot and comma
+    s = s.replace(" ", "")
+    cleaned = re.sub(r"[^\d.,]", "", s)
+    cleaned = cleaned.replace(",", ".")
+    # If multiple dots (shouldn't happen), keep last as decimal
+    if cleaned.count(".") > 1:
+        parts = cleaned.split(".")
+        cleaned = "".join(parts[:-1]) + "." + parts[-1]
     try:
         return float(cleaned) if cleaned else 0.0
     except ValueError:
@@ -250,18 +262,13 @@ class SheetsClient:
         ws.update_cell(row_num, COL_FACT + 1, int(new_fact))
         # COL_DEBT (H) не трогаем — там формула =F-G, пересчитается автоматически
 
-        # Write link as clickable HYPERLINK formula
+        # Write link as plain URL (Google Sheets auto-detects as clickable)
         existing_link = ws.cell(row_num, COL_CHECK_LINK + 1).value
         if existing_link and existing_link.strip():
-            # Append new link on next line (keep existing as-is)
             new_link_value = "{}\n{}".format(existing_link, check_link)
-            ws.update_cell(row_num, COL_CHECK_LINK + 1, new_link_value)
         else:
-            # Single link — use HYPERLINK formula for clickability
-            ws.update_cell(
-                row_num, COL_CHECK_LINK + 1,
-                '=HYPERLINK("{}","Ссылка на чек")'.format(check_link)
-            )
+            new_link_value = check_link
+        ws.update_cell(row_num, COL_CHECK_LINK + 1, new_link_value)
 
         if comment:
             ws.update_cell(row_num, COL_COMMENT + 1, comment)
