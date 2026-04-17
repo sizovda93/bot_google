@@ -5,6 +5,7 @@ import logging
 import sys
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
 from dotenv import load_dotenv
 
 from bot.config import Config
@@ -33,7 +34,8 @@ async def main() -> None:
     config = Config.from_env()
     init_services(config)
 
-    bot = Bot(token=config.telegram_bot_token)
+    session = AiohttpSession(timeout=120)
+    bot = Bot(token=config.telegram_bot_token, session=session)
     dp = Dispatcher()
     dp.include_router(router)
 

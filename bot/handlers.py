@@ -1,5 +1,6 @@
 """Telegram message handlers: receive receipts and process them."""
 
+import asyncio
 import logging
 import tempfile
 from pathlib import Path
@@ -175,18 +176,22 @@ async def _process_receipt(message: Message, bot: Bot, ext: str) -> None:
         await bot.download_file(file.file_path, tmp_path)
         logger.info("Downloaded: %s (%d bytes)", tmp_path.name, tmp_path.stat().st_size)
 
-        # Step 2: Extract client FIOs + partner from caption (via LLM)
-        caption_data = CaptionData(clients=[], partner=None, is_deposit=False)
+        # Step 2+3: Parse caption AND receipt in PARALLEL (saves 3-5 sec)
+        caption_task = None
         if message.caption:
-            caption_data = await parse_caption(
-                message.caption, config.openai_api_key, config.openai_base_url
+            caption_task = asyncio.create_task(
+                parse_caption(message.caption, config.openai_api_key, config.openai_base_url)
             )
+        receipt_task = asyncio.create_task(
+            parse_receipt(tmp_path, config.openai_api_key, config.openai_base_url)
+        )
+
+        caption_data = CaptionData(clients=[], partner=None, is_deposit=False)
+        if caption_task:
+            caption_data = await caption_task
             logger.info("Caption: clients=%s, partner=%s", caption_data.clients, caption_data.partner)
 
-        # Step 3: Parse receipt (amount, date, and backup FIO)
-        receipt = await parse_receipt(
-            tmp_path, config.openai_api_key, config.openai_base_url
-        )
+        receipt = await receipt_task
         logger.info("Parsed receipt: %s", receipt)
 
         # Build client list: caption clients first, receipt debtors as fallback

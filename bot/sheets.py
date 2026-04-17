@@ -2,6 +2,7 @@
 
 import logging
 import re
+import time
 from typing import Optional, Tuple
 
 import gspread
@@ -120,17 +121,37 @@ class SheetsClient:
         if not self.worksheets:
             raise ValueError("No worksheets found with names: {}".format(self.SHEET_NAMES))
 
+        # Cache: worksheet_name → (timestamp, all_values)
+        self._cache = {}  # type: dict
+        self._cache_ttl = 300  # 5 minutes
+
         logger.info(
             "Connected to sheet '%s', worksheets: %s",
             self.spreadsheet.title,
             list(self.worksheets.keys()),
         )
 
+    def _get_cached_values(self, ws: gspread.Worksheet) -> list:
+        """Get all values from worksheet, cached for 5 minutes."""
+        now = time.time()
+        cached = self._cache.get(ws.title)
+        if cached and (now - cached[0]) < self._cache_ttl:
+            return cached[1]
+
+        values = ws.get_all_values()
+        self._cache[ws.title] = (now, values)
+        logger.info("Cached %d rows from '%s'", len(values), ws.title)
+        return values
+
+    def _invalidate_cache(self, ws_title: str) -> None:
+        """Clear cache for a worksheet after writing."""
+        self._cache.pop(ws_title, None)
+
     def _search_in_worksheet(
         self, ws: gspread.Worksheet, debtor_fio: str, partner_hint: Optional[str]
     ) -> list:
         """Search for debtor in a single worksheet. Returns list of candidates."""
-        all_values = ws.get_all_values()
+        all_values = self._get_cached_values(ws)
         if len(all_values) < 2:
             return []
 
@@ -237,6 +258,9 @@ class SheetsClient:
 
         if comment:
             ws.update_cell(row_num, COL_COMMENT + 1, comment)
+
+        # Invalidate cache after writing
+        self._invalidate_cache(ws.title)
 
         logger.info(
             "Updated row %d in '%s': fact=%s, link=%s",
