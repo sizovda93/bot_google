@@ -99,42 +99,44 @@ def _format_money(amount: float) -> str:
 
 
 class SheetsClient:
+    # Worksheet names to scan (in priority order — newest first)
+    SHEET_NAMES = ["2026", "2025", "2024"]
+
     def __init__(self, service_account_path: str, spreadsheet_id: str, gid: int):
         creds = Credentials.from_service_account_file(
             service_account_path, scopes=SCOPES
         )
         self.gc = gspread.authorize(creds)
         self.spreadsheet = self.gc.open_by_key(spreadsheet_id)
-        self.worksheet = self._get_worksheet_by_gid(gid)
+        self.default_gid = gid
+
+        # Load all target worksheets
+        self.worksheets = {}  # type: dict  # name → gspread.Worksheet
+        for ws in self.spreadsheet.worksheets():
+            if ws.title in self.SHEET_NAMES:
+                self.worksheets[ws.title] = ws
+                logger.info("Loaded worksheet: '%s' (gid=%d)", ws.title, ws.id)
+
+        if not self.worksheets:
+            raise ValueError("No worksheets found with names: {}".format(self.SHEET_NAMES))
+
         logger.info(
-            "Connected to sheet '%s', worksheet '%s'",
+            "Connected to sheet '%s', worksheets: %s",
             self.spreadsheet.title,
-            self.worksheet.title,
+            list(self.worksheets.keys()),
         )
 
-    def _get_worksheet_by_gid(self, gid: int) -> gspread.Worksheet:
-        """Find worksheet by GID."""
-        for ws in self.spreadsheet.worksheets():
-            if ws.id == gid:
-                return ws
-        raise ValueError(f"Worksheet with GID {gid} not found")
-
-    def find_debtor_row(
-        self, debtor_fio: str, partner_hint: Optional[str] = None
-    ) -> Optional[Tuple[int, dict]]:
-        """
-        Search for debtor by FIO (fuzzy match).
-        If partner_hint is given, uses it to disambiguate duplicates.
-        Returns (row_number_1based, row_data_dict) or None.
-        """
-        all_values = self.worksheet.get_all_values()
+    def _search_in_worksheet(
+        self, ws: gspread.Worksheet, debtor_fio: str, partner_hint: Optional[str]
+    ) -> list:
+        """Search for debtor in a single worksheet. Returns list of candidates."""
+        all_values = ws.get_all_values()
         if len(all_values) < 2:
-            return None
+            return []
 
         normalized_query = _normalize_fio(debtor_fio)
         candidates = []
 
-        # Skip header row (index 0)
         for idx, row in enumerate(all_values[1:], start=2):
             if len(row) <= COL_FIO or not row[COL_FIO].strip():
                 continue
@@ -142,11 +144,9 @@ class SheetsClient:
             cell_fio = row[COL_FIO].strip()
             normalized_cell = _normalize_fio(cell_fio)
 
-            # Consonant filter: reject if consonant structure doesn't match
             if not _consonants_compatible(normalized_query, normalized_cell):
                 continue
 
-            # Try multiple fuzzy strategies
             score_ratio = fuzz.ratio(normalized_query, normalized_cell)
             score_partial = fuzz.partial_ratio(normalized_query, normalized_cell)
             score_sort = fuzz.token_sort_ratio(normalized_query, normalized_cell)
@@ -154,87 +154,98 @@ class SheetsClient:
 
             if fio_score >= FUZZY_MATCH_THRESHOLD:
                 cell_partner = row[COL_PARTNER].strip() if len(row) > COL_PARTNER else ""
-                candidates.append((idx, row, cell_fio, cell_partner, fio_score))
+                candidates.append((idx, row, cell_fio, cell_partner, fio_score, ws))
 
-        if not candidates:
-            logger.warning("No match for '%s' in sheet", debtor_fio)
+        return candidates
+
+    def find_debtor_row(
+        self, debtor_fio: str, partner_hint: Optional[str] = None
+    ) -> Optional[Tuple[int, dict]]:
+        """
+        Search for debtor across all worksheets (2026, 2025, 2024).
+        If partner_hint is given, uses it to disambiguate duplicates.
+        Returns (row_number_1based, row_data_dict) or None.
+        row_data_dict includes '_worksheet' key for update_payment.
+        """
+        all_candidates = []
+
+        for sheet_name in self.SHEET_NAMES:
+            ws = self.worksheets.get(sheet_name)
+            if not ws:
+                continue
+            candidates = self._search_in_worksheet(ws, debtor_fio, partner_hint)
+            all_candidates.extend(candidates)
+
+        if not all_candidates:
+            logger.warning("No match for '%s' in any worksheet", debtor_fio)
             return None
 
         # If partner hint given — pick the candidate whose partner matches best
-        if partner_hint and len(candidates) > 1:
+        if partner_hint and len(all_candidates) > 1:
             norm_hint = _normalize_fio(partner_hint)
             best = None
             best_combined = 0
-            for idx, row, cell_fio, cell_partner, fio_score in candidates:
+            for idx, row, cell_fio, cell_partner, fio_score, ws in all_candidates:
                 partner_score = fuzz.partial_ratio(norm_hint, _normalize_fio(cell_partner))
                 combined = fio_score + partner_score
                 if combined > best_combined:
                     best_combined = combined
-                    best = (idx, row, cell_fio, cell_partner, fio_score)
+                    best = (idx, row, cell_fio, cell_partner, fio_score, ws)
             if best:
-                idx, row, cell_fio, cell_partner, fio_score = best
-                logger.info(
-                    "Matched by FIO+partner: '%s'+'%s' → '%s'+'%s' (fio=%d, row=%d)",
-                    debtor_fio, partner_hint, cell_fio, cell_partner, fio_score, idx,
-                )
-                candidates = [best]
+                all_candidates = [best]
 
         # Take best by FIO score
-        best_candidate = max(candidates, key=lambda c: c[4])
-        row_num, row_data, matched_fio, matched_partner, score = best_candidate
+        best_candidate = max(all_candidates, key=lambda c: c[4])
+        row_num, row_data, matched_fio, matched_partner, score, ws = best_candidate
 
         logger.info(
-            "Fuzzy match: '%s' → '%s' (score=%d, partner='%s', row=%d)",
-            debtor_fio, matched_fio, score, matched_partner, row_num,
+            "Fuzzy match: '%s' → '%s' (score=%d, partner='%s', row=%d, sheet='%s')",
+            debtor_fio, matched_fio, score, matched_partner, row_num, ws.title,
         )
         return row_num, {
             "fio": matched_fio,
             "partner": row_data[COL_PARTNER] if len(row_data) > COL_PARTNER else "",
-                "plan": row_data[COL_PLAN] if len(row_data) > COL_PLAN else "",
-                "fact": row_data[COL_FACT] if len(row_data) > COL_FACT else "",
-                "debt": row_data[COL_DEBT] if len(row_data) > COL_DEBT else "",
-                "check_link": row_data[COL_CHECK_LINK] if len(row_data) > COL_CHECK_LINK else "",
-            }
-
-        logger.warning(
-            "No match for '%s' (best score=%d)", debtor_fio, best_score
-        )
-        return None
+            "plan": row_data[COL_PLAN] if len(row_data) > COL_PLAN else "",
+            "fact": row_data[COL_FACT] if len(row_data) > COL_FACT else "",
+            "debt": row_data[COL_DEBT] if len(row_data) > COL_DEBT else "",
+            "check_link": row_data[COL_CHECK_LINK] if len(row_data) > COL_CHECK_LINK else "",
+            "_worksheet": ws,
+            "_sheet_name": ws.title,
+        }
 
     def update_payment(
-        self, row_num: int, amount: float, check_link: str, comment: Optional[str] = None
+        self, row_num: int, amount: float, check_link: str,
+        comment: Optional[str] = None, worksheet: "Optional[gspread.Worksheet]" = None
     ) -> None:
         """Update the fact amount, debt, check link, and optionally comment."""
-        # Read current plan value to calculate new debt
-        plan_cell = self.worksheet.cell(row_num, COL_PLAN + 1).value
+        # Use specific worksheet if provided, otherwise first available
+        ws = worksheet or list(self.worksheets.values())[0]
+
+        plan_cell = ws.cell(row_num, COL_PLAN + 1).value
         plan_amount = _parse_money(plan_cell)
 
-        # Read current fact value (might have partial payment already)
-        fact_cell = self.worksheet.cell(row_num, COL_FACT + 1).value
+        fact_cell = ws.cell(row_num, COL_FACT + 1).value
         current_fact = _parse_money(fact_cell)
         new_fact = current_fact + amount
 
         new_debt = max(0, plan_amount - new_fact)
 
-        # Batch update: fact, debt, check link
-        self.worksheet.update_cell(row_num, COL_FACT + 1, _format_money(new_fact))
-        self.worksheet.update_cell(row_num, COL_DEBT + 1, _format_money(new_debt))
+        ws.update_cell(row_num, COL_FACT + 1, _format_money(new_fact))
+        ws.update_cell(row_num, COL_DEBT + 1, _format_money(new_debt))
 
-        # Append link (don't overwrite if there's already one)
-        existing_link = self.worksheet.cell(row_num, COL_CHECK_LINK + 1).value
+        existing_link = ws.cell(row_num, COL_CHECK_LINK + 1).value
         if existing_link and existing_link.strip():
             new_link_value = "{}\n{}".format(existing_link, check_link)
         else:
             new_link_value = check_link
-        self.worksheet.update_cell(row_num, COL_CHECK_LINK + 1, new_link_value)
+        ws.update_cell(row_num, COL_CHECK_LINK + 1, new_link_value)
 
-        # Write comment if provided
         if comment:
-            self.worksheet.update_cell(row_num, COL_COMMENT + 1, comment)
+            ws.update_cell(row_num, COL_COMMENT + 1, comment)
 
         logger.info(
-            "Updated row %d: fact=%s, debt=%s, link=%s",
-            row_num,
+            "Updated row %d in '%s': fact=%s, debt=%s, link=%s",
+            row_num, ws.title,
             _format_money(new_fact),
             _format_money(new_debt),
             check_link,

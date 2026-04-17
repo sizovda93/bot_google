@@ -266,9 +266,11 @@ async def _finish_multi(
                     amount=amount_per_client,
                     check_link=public_url,
                     comment=deposit_comment,
+                    worksheet=row_data.get("_worksheet"),
                 )
-                results.append("✅ {} — строка {} ({})".format(
-                    row_data["fio"], row_num, row_data["partner"]
+                sheet_label = row_data.get("_sheet_name", "")
+                results.append("✅ {} — строка {} ({}) [{}]".format(
+                    row_data["fio"], row_num, row_data["partner"], sheet_label
                 ))
                 logger.info("Updated: %s, row %d, %s RUB", row_data["fio"], row_num, amount_per_client)
             else:
